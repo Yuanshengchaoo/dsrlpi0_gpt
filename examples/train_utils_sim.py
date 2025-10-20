@@ -2,6 +2,40 @@ from tqdm import tqdm
 import numpy as np
 import wandb
 import jax
+import jax.numpy as jnp
+
+
+def _ensure_chunk_noise_batch(noise: jnp.ndarray, chunk_shape) -> jnp.ndarray:
+    """Ensure chunk noises always include a batch dimension.
+
+    When the batch size is one, conversions between NumPy and JAX arrays can
+    drop the leading axis. The downstream logic expects tensors with shape
+    ``(batch, chunk_len, noise_dim)``; this helper restores that structure.
+    """
+    noise = jnp.asarray(noise)
+    if noise.ndim == 3:
+        return noise
+
+    chunk_len = int(chunk_shape[0])
+    action_dim = int(chunk_shape[1])
+    full_dim = chunk_len * action_dim
+
+    if noise.ndim == 2:
+        if noise.shape == (chunk_len, action_dim):
+            return noise[jnp.newaxis, ...]
+        if noise.shape[1] == full_dim:
+            batch = noise.shape[0]
+            return noise.reshape((batch, chunk_len, action_dim))
+        if noise.shape[0] == 1 and noise.shape[1] == action_dim:
+            return noise.reshape((1, 1, action_dim))
+    elif noise.ndim == 1:
+        if noise.shape[0] == full_dim:
+            return noise.reshape((1, chunk_len, action_dim))
+        if noise.shape[0] == action_dim:
+            return noise.reshape((1, 1, action_dim))
+
+    batch = noise.shape[0] if noise.ndim > 0 else 1
+    return noise.reshape((batch, chunk_len, action_dim))
 from openpi_client import image_tools
 import math
 import PIL
@@ -167,6 +201,7 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
     episode_len = len(actions)
     rewards = np.array(traj['rewards'])
     masks = np.array(traj['masks'])
+    chunk_lengths = np.array(traj.get('chunk_lengths', [discount_horizon] * episode_len))
 
     for t in range(episode_len):
         obs = traj['observations'][t]
@@ -177,7 +212,7 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
         if not variant.add_states:
             obs.pop('state', None)
             next_obs.pop('state', None)
-        
+
         insert_dict = dict(
             observations=obs,
             next_observations=next_obs,
@@ -185,7 +220,7 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
             next_actions=actions[t + 1] if t < episode_len - 1 else actions[t],
             rewards=rewards[t],
             masks=masks[t],
-            discount=variant.discount ** discount_horizon
+            discount=variant.discount ** int(chunk_lengths[t])
         )
         online_replay_buffer.insert(insert_dict)
     online_replay_buffer.increment_traj_counter()
@@ -196,20 +231,25 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     env_max_reward = variant.env_max_reward
 
     agent._rng, rng = jax.random.split(agent._rng)
-    
+
     if 'libero' in variant.env:
         obs = env.reset()
     elif 'aloha' in variant.env:
         obs, _ = env.reset()
-    
+
     image_list = [] # for visualization
-    rewards = []
+    step_rewards = []
     action_list = []
     obs_list = []
+    chunk_rewards = []
+    chunk_masks = []
+    chunk_lengths = []
+    done = False
+    actions = None
 
     for t in tqdm(range(max_timesteps)):
         curr_image = obs_to_img(obs, variant)
-        
+
         qpos = obs_to_qpos(obs, variant)
 
         if variant.add_states:
@@ -228,33 +268,43 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
             # we then use the noise to sample the action from diffusion model
             rng, key = jax.random.split(rng)
             obs_pi_zero = obs_to_pi_zero_input(obs, variant)
+            chunk_rewards.append(0.0)
+            chunk_masks.append(1.0)
+            chunk_lengths.append(0)
+            obs_list.append(obs_dict)
             if i == 0:
                 # for initial round of data collection, we sample from standard gaussian noise
-                noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
-                noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 50 - noise.shape[1], axis=1)
-                noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                actions_noise = noise[0, :agent.action_chunk_shape[0], :]
+                chunk_noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
+                actions_noise = np.array(chunk_noise[0])
             else:
                 # sac agent predicts the noise for diffusion model
-                actions_noise = agent.sample_actions(obs_dict)
-                actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
-                noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
-            
+                sampled_chunk = agent.sample_actions(obs_dict)
+                chunk_noise = _ensure_chunk_noise_batch(sampled_chunk, agent.action_chunk_shape)
+                actions_noise = np.array(sampled_chunk[0])
+
+            chunk_noise = _ensure_chunk_noise_batch(chunk_noise, agent.action_chunk_shape)
+
+            noise_repeat = jax.numpy.repeat(chunk_noise[:, -1:, :], 50 - chunk_noise.shape[1], axis=1)
+            noise = jax.numpy.concatenate([chunk_noise, noise_repeat], axis=1)
+
             actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
             action_list.append(actions_noise)
-            obs_list.append(obs_dict)
-     
+
         action_t = actions[t % query_frequency]
         if 'libero' in variant.env:
             obs, reward, done, _ = env.step(action_t)
         elif 'aloha' in variant.env:
             obs, reward, terminated, truncated, _ = env.step(action_t)
             done = terminated or truncated
-            
-        rewards.append(reward)
+
+        chunk_lengths[-1] += 1
+        if variant.chunk_reward_mode == 'sum':
+            discount_factor = variant.discount ** (chunk_lengths[-1] - 1)
+            chunk_rewards[-1] += discount_factor * reward
+        step_rewards.append(reward)
         image_list.append(curr_image)
         if done:
+            chunk_masks[-1] = 0.0
             break
 
     # add last observation
@@ -262,39 +312,45 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     qpos = obs_to_qpos(obs, variant)
     obs_dict = {
         'pixels': curr_image[np.newaxis, ..., np.newaxis],
-        'state': qpos[np.newaxis, ..., np.newaxis],
     }
+    if variant.add_states:
+        obs_dict['state'] = qpos[np.newaxis, ..., np.newaxis]
     obs_list.append(obs_dict)
     image_list.append(curr_image)
-    
+
     # per episode
-    rewards = np.array(rewards)
-    episode_return = np.sum(rewards[rewards!=None])
-    is_success = (reward == env_max_reward)
+    step_rewards = np.array(step_rewards)
+    last_reward = step_rewards[-1] if len(step_rewards) > 0 else 0.0
+    episode_return = np.sum(step_rewards[step_rewards!=None]) if len(step_rewards) > 0 else 0.0
+    is_success = (last_reward == env_max_reward)
     print(f'Rollout Done: {episode_return=}, Success: {is_success}')
-    
-    
+
+
     '''
-    We use sparse -1/0 reward to train the SAC agent.
+    Configure chunk-level rewards for online RL updates.
     '''
-    if is_success:
-        query_steps = len(action_list)
-        rewards = np.concatenate([-np.ones(query_steps - 1), [0]])
-        masks = np.concatenate([np.ones(query_steps - 1), [0]])
+    query_steps = len(action_list)
+    if variant.chunk_reward_mode == 'sparse':
+        if is_success:
+            rewards = np.concatenate([-np.ones(query_steps - 1), [0]]) if query_steps > 0 else np.array([])
+            masks = np.concatenate([np.ones(query_steps - 1), [0]]) if query_steps > 0 else np.array([])
+        else:
+            rewards = -np.ones(query_steps)
+            masks = np.ones(query_steps)
     else:
-        query_steps = len(action_list)
-        rewards = -np.ones(query_steps)
-        masks = np.ones(query_steps)
+        rewards = np.array(chunk_rewards[:query_steps], dtype=np.float32)
+        masks = np.array(chunk_masks[:query_steps], dtype=np.float32)
 
     return {
         'observations': obs_list,
         'actions': action_list,
         'rewards': rewards,
         'masks': masks,
+        'chunk_lengths': np.array(chunk_lengths[:query_steps], dtype=np.int32),
         'is_success': is_success,
         'episode_return': episode_return,
         'images': image_list,
-        'env_steps': t + 1 
+        'env_steps': t + 1
     }
 
 def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
@@ -336,19 +392,22 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
 
                 rng, key = jax.random.split(rng)
                 assert agent_dp is not None
-                
+
                 obs_pi_zero = obs_to_pi_zero_input(obs, variant)
-                
-                
+
+
                 if i == 0:
                     # for initial evaluation, we sample from standard gaussian noise to evaluate the base policy's performance
-                    noise = jax.random.normal(rng, (1, 50, 32))
+                    chunk_noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
                 else:
-                    actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
-                    noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                    noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
-                    
+                    sampled_chunk = agent.sample_actions(obs_dict)
+                    chunk_noise = _ensure_chunk_noise_batch(sampled_chunk, agent.action_chunk_shape)
+
+                chunk_noise = _ensure_chunk_noise_batch(chunk_noise, agent.action_chunk_shape)
+
+                noise_repeat = jax.numpy.repeat(chunk_noise[:, -1:, :], 50 - chunk_noise.shape[1], axis=1)
+                noise = jax.numpy.concatenate([chunk_noise, noise_repeat], axis=1)
+
                 actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
               
             action_t = actions[t % query_frequency]

@@ -12,6 +12,34 @@ from openpi_client import image_tools
 from moviepy.editor import ImageSequenceClip
 
 
+def _ensure_chunk_noise_batch(noise, chunk_shape):
+    """Normalise chunk noise tensors to (batch, chunk_len, noise_dim)."""
+    noise = jax.numpy.asarray(noise)
+    if noise.ndim == 3:
+        return noise
+
+    chunk_len = int(chunk_shape[0])
+    action_dim = int(chunk_shape[1])
+    full_dim = chunk_len * action_dim
+
+    if noise.ndim == 2:
+        if noise.shape == (chunk_len, action_dim):
+            return noise[jax.numpy.newaxis, ...]
+        if noise.shape[1] == full_dim:
+            batch = noise.shape[0]
+            return noise.reshape((batch, chunk_len, action_dim))
+        if noise.shape[0] == 1 and noise.shape[1] == action_dim:
+            return noise.reshape((1, 1, action_dim))
+    elif noise.ndim == 1:
+        if noise.shape[0] == full_dim:
+            return noise.reshape((1, chunk_len, action_dim))
+        if noise.shape[0] == action_dim:
+            return noise.reshape((1, 1, action_dim))
+
+    batch = noise.shape[0] if noise.ndim > 0 else 1
+    return noise.reshape((batch, chunk_len, action_dim))
+
+
 def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger,
                                        shard_fn=None, agent_dp=None, robot_config=None):
     replay_buffer_iterator = replay_buffer.get_iterator(variant.batch_size)
@@ -166,15 +194,16 @@ def collect_traj(variant, agent, env, i, agent_dp=None, wandb_logger=None, traj_
                 }
                 if i == 0:
                     noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
-                    noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 10 - noise.shape[1], axis=1)
-                    noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                    actions_noise = noise[0, :agent.action_chunk_shape[0], :]
                 else:
                     # sac agent predicts the noise for diffusion model
                     actions_noise = agent.sample_actions(obs_dict)
                     actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
-                    noise = np.repeat(actions_noise[-1:, :], 10 - actions_noise.shape[0], axis=0)
-                    noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                    noise = _ensure_chunk_noise_batch(actions_noise, agent.action_chunk_shape)
+
+                noise = _ensure_chunk_noise_batch(noise, agent.action_chunk_shape)
+                noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 10 - noise.shape[1], axis=1)
+                noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
+                actions_noise = noise[0, :agent.action_chunk_shape[0], :]
                 action_list.append(actions_noise)
                 obs_list.append(obs_dict)
                 action = agent_dp.infer(request_data, noise=np.asarray(noise))["actions"]
