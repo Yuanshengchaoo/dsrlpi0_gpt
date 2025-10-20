@@ -242,12 +242,20 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
             if i == 0:
                 # for initial round of data collection, we sample from standard gaussian noise
                 chunk_noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
-                actions_noise = np.array(chunk_noise[0])
             else:
                 # sac agent predicts the noise for diffusion model
                 sampled_chunk = agent.sample_actions(obs_dict)
                 chunk_noise = jnp.asarray(sampled_chunk)
-                actions_noise = np.array(sampled_chunk[0])
+
+            if chunk_noise.ndim == len(agent.action_chunk_shape):
+                # Missing the batch dimension, add it back for downstream logic.
+                chunk_noise = chunk_noise.reshape((1, *agent.action_chunk_shape))
+            elif chunk_noise.ndim != len(agent.action_chunk_shape) + 1:
+                # Fallback to reshaping based on the learnt chunk shape. This guards against
+                # chunks that are flattened to (batch, prod(chunk_shape)).
+                chunk_noise = chunk_noise.reshape((-1, *agent.action_chunk_shape))
+
+            actions_noise = np.array(chunk_noise[0])
 
             noise_repeat = jax.numpy.repeat(chunk_noise[:, -1:, :], 50 - chunk_noise.shape[1], axis=1)
             noise = jax.numpy.concatenate([chunk_noise, noise_repeat], axis=1)
@@ -367,6 +375,11 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
                 else:
                     sampled_chunk = agent.sample_actions(obs_dict)
                     chunk_noise = jnp.asarray(sampled_chunk)
+
+                if chunk_noise.ndim == len(agent.action_chunk_shape):
+                    chunk_noise = chunk_noise.reshape((1, *agent.action_chunk_shape))
+                elif chunk_noise.ndim != len(agent.action_chunk_shape) + 1:
+                    chunk_noise = chunk_noise.reshape((-1, *agent.action_chunk_shape))
 
                 noise_repeat = jax.numpy.repeat(chunk_noise[:, -1:, :], 50 - chunk_noise.shape[1], axis=1)
                 noise = jax.numpy.concatenate([chunk_noise, noise_repeat], axis=1)
