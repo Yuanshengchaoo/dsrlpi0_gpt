@@ -1,15 +1,20 @@
 import argparse
 import sys
+
 from examples.train_sim import main
 from jaxrl2.utils.launch_util import parse_training_args
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument('--algorithm', default='noise_chunk_fql', help='type of algorithm', type=str)
+    base_args, _ = base_parser.parse_known_args()
+    algorithm = base_args.algorithm
 
+    parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=42, help='Random seed.', type=int)
     parser.add_argument('--launch_group_id', default='', help='group id used to group runs on wandb.')
-    parser.add_argument('--eval_episodes', default=10,help='Number of episodes used for evaluation.', type=int)
+    parser.add_argument('--eval_episodes', default=10, help='Number of episodes used for evaluation.', type=int)
     parser.add_argument('--env', default='libero', help='name of environment')
     parser.add_argument('--log_interval', default=1000, help='Logging interval.', type=int)
     parser.add_argument('--eval_interval', default=5000, help='Eval interval.', type=int)
@@ -19,40 +24,66 @@ if __name__ == '__main__':
     parser.add_argument('--add_states', default=1, help='whether to add low-dim states to the obervations', type=int)
     parser.add_argument('--wandb_project', default='cql_sim_online', help='wandb project')
     parser.add_argument('--start_online_updates', default=1000, help='number of steps to collect before starting online updates', type=int)
-    parser.add_argument('--algorithm', default='pixel_sac', help='type of algorithm')
+    parser.add_argument('--algorithm', default=algorithm, help='type of algorithm', type=str)
     parser.add_argument('--prefix', default='', help='prefix to use for wandb')
     parser.add_argument('--suffix', default='', help='suffix to use for wandb')
     parser.add_argument('--multi_grad_step', default=1, help='Number of graident steps to take per environment step, aka UTD', type=int)
     parser.add_argument('--resize_image', default=-1, help='the size of image if need resizing', type=int)
     parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
-    
-    train_args_dict = dict(
-        actor_lr=1e-4,
-        critic_lr= 3e-4,
-        temp_lr=3e-4,
-        hidden_dims= (128, 128, 128),
-        cnn_features= (32, 32, 32, 32),
-        cnn_strides= (2, 1, 1, 1),
-        cnn_padding= 'VALID',
-        latent_dim= 50,
-        discount= 0.999,
-        tau= 0.005,
-        critic_reduction = 'mean',
-        dropout_rate=0.0,
-        aug_next=1,
-        use_bottleneck=True,
-        encoder_type='small',
-        encoder_norm='group',
-        use_spatial_softmax=True,
-        softmax_temperature=-1,
-        target_entropy='auto',
-        num_qs=10,
-        action_magnitude=1.0,
-        num_cameras=1,
+
+    if algorithm == 'noise_chunk_fql':
+        train_args_dict = dict(
+            actor_lr=3e-4,
+            critic_lr=3e-4,
+            flow_lr=3e-4,
+            student_hidden_dims=(256, 256),
+            flow_hidden_dims=(256, 256),
+            critic_hidden_dims=(256, 256),
+            latent_dim=128,
+            discount=0.99,
+            tau=0.005,
+            distill_weight=25.0,
+            bc_weight=1.0,
+            num_qs=2,
+            flow_num_integration_steps=16,
+            use_bottleneck=True,
+            encoder_type='resnet_18_v1',
+            encoder_norm='group',
+            use_spatial_softmax=True,
+            softmax_temperature=1.0,
+            best_of_n=8,
+            use_best_of_n=1,
+            use_student_policy=1,
+            noise_chunk_size=5,
+            chunk_reward_mode='sum',
+        )
+    else:
+        train_args_dict = dict(
+            actor_lr=1e-4,
+            critic_lr=3e-4,
+            temp_lr=3e-4,
+            hidden_dims=(128, 128, 128),
+            cnn_features=(32, 32, 32, 32),
+            cnn_strides=(2, 1, 1, 1),
+            cnn_padding='VALID',
+            latent_dim=50,
+            discount=0.999,
+            tau=0.005,
+            critic_reduction='mean',
+            dropout_rate=0.0,
+            aug_next=1,
+            use_bottleneck=True,
+            encoder_type='small',
+            encoder_norm='group',
+            use_spatial_softmax=True,
+            softmax_temperature=-1,
+            target_entropy='auto',
+            num_qs=10,
+            action_magnitude=1.0,
+            num_cameras=1,
         )
 
     variant, args = parse_training_args(train_args_dict, parser)
     print(variant)
     main(variant)
     sys.exit()
-    

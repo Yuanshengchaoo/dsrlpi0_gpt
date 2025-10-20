@@ -8,7 +8,7 @@ os.environ['XLA_FLAGS'] = xla_flags
 import pathlib, copy
 
 import jax
-from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
+from jaxrl2.agents import NoiseChunkFQLAgent, PixelSACLearner
 from jaxrl2.utils.general_utils import add_batch_dim
 import numpy as np
 
@@ -73,7 +73,8 @@ class DummyEnv(gym.ObservationWrapper):
                 state_dim = 14
             obs_dict['state'] = Box(low=-1.0, high=1.0, shape=(state_dim, 1), dtype=np.float32)
         self.observation_space = Dict(obs_dict)
-        self.action_space = Box(low=-1, high=1, shape=(1, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
+        chunk_size = getattr(variant, 'noise_chunk_size', max(1, variant.query_freq))
+        self.action_space = Box(low=-1, high=1, shape=(chunk_size, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
 
 
 def main(variant):
@@ -89,7 +90,7 @@ def main(variant):
     # prevent tensorflow from using GPUs
     tf.config.set_visible_devices([], "GPU")
     
-    kwargs = variant['train_kwargs']
+    kwargs = dict(variant['train_kwargs'])
     if kwargs.pop('cosine_decay', False):
         kwargs['decay_steps'] = variant.max_steps
         
@@ -137,6 +138,21 @@ def main(variant):
     wandb_output_dir = tempfile.mkdtemp()
     wandb_logger = WandBLogger(variant.prefix != '', variant, variant.wandb_project, experiment_id=expname, output_dir=wandb_output_dir, group_name=group_name)
 
+    chunk_reward_mode = kwargs.pop('chunk_reward_mode', None)
+    if chunk_reward_mode is not None:
+        variant.chunk_reward_mode = chunk_reward_mode
+    elif not hasattr(variant, 'chunk_reward_mode'):
+        variant.chunk_reward_mode = 'sparse'
+
+    if variant.algorithm == 'noise_chunk_fql':
+        noise_chunk_size = kwargs.pop('noise_chunk_size', variant.query_freq if variant.query_freq > 0 else 1)
+        variant.query_freq = noise_chunk_size
+    else:
+        noise_chunk_size = max(1, variant.query_freq if variant.query_freq > 0 else 1)
+        if variant.query_freq <= 0:
+            variant.query_freq = noise_chunk_size
+    variant.noise_chunk_size = noise_chunk_size
+
     dummy_env = DummyEnv(variant)
     sample_obs = add_batch_dim(dummy_env.observation_space.sample())
     sample_action = add_batch_dim(dummy_env.action_space.sample())
@@ -154,7 +170,13 @@ def main(variant):
         raise NotImplementedError()
     agent_dp = policy_config.create_trained_policy(config, checkpoint_dir)
     print("Loaded pi0 policy from %s", checkpoint_dir)
-    agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
+    algorithm = variant.algorithm
+    if algorithm == 'noise_chunk_fql':
+        agent = NoiseChunkFQLAgent(variant.seed, sample_obs, sample_action, **kwargs)
+    elif algorithm == 'pixel_sac':
+        agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
 
     online_buffer_size = variant.max_steps  // variant.multi_grad_step
     online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
