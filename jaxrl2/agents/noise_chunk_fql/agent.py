@@ -404,9 +404,10 @@ class NoiseChunkFQLAgent(Agent):
             self._critic,
             self._target_critic_params,
             batch,
-            self.tau,
-            self.distill_weight,
-            self.bc_weight,
+            discount=self.discount,
+            tau=self.tau,
+            distill_weight=self.distill_weight,
+            bc_weight=self.bc_weight,
         )
         self.actor_teacher = new_teacher
         self.actor_student = new_student
