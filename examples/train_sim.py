@@ -111,9 +111,15 @@ def main(variant):
     
     if variant.env == 'libero':
         benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict["libero_90"]()
-        task_id = 57
+        task_suite = benchmark_dict["libero_spatial"]()
+        task_id = 0
         task = task_suite.get_task(task_id)
+        # >>> 在这里追加 <<<  （确定了 task_suite / task_id / task 之后）
+        variant.libero_init_states = task_suite.get_task_init_states(task_id)  # 固定初始状态列表
+        variant.num_steps_wait = getattr(variant, "num_steps_wait", 10)        # 开局空转等待步数（与 openpi 评测一致）
+        variant.libero_dummy_action = getattr(variant, "libero_dummy_action", [0.0]*6 + [-1.0])  # 等待时用的占位动作
+        variant.episode_idx = 0  # 可选：给 collect_traj 用来索引 init_state
+        # <<< 在这里追加 >>>
         env, task_description = _get_libero_env(task, 256, variant.seed)
         eval_env = env
         variant.task_description = task_description
@@ -161,8 +167,10 @@ def main(variant):
     
 
     if variant.env == 'libero':
-        config = openpi_config.get_config("pi0_libero")
-        checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_libero")
+        # config = openpi_config.get_config("pi0_libero")
+        # checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_libero")
+        config = openpi_config.get_config("pi0_piper_libero")
+        checkpoint_dir = "/mnt/afs/vva/all_checkponit/openpi-assets/checkpoints/libero_task03"
     elif variant.env == 'aloha_cube':
         config = openpi_config.get_config("pi0_aloha_sim")
         checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_aloha_sim")

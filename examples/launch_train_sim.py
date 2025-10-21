@@ -7,6 +7,7 @@ from jaxrl2.utils.launch_util import parse_training_args
 
 if __name__ == '__main__':
     base_parser = argparse.ArgumentParser(add_help=False)
+    # pixel_sac, noise_chunk_fql
     base_parser.add_argument('--algorithm', default='noise_chunk_fql', help='type of algorithm', type=str)
     base_args, _ = base_parser.parse_known_args()
     algorithm = base_args.algorithm
@@ -56,6 +57,8 @@ if __name__ == '__main__':
             use_student_policy=1,
             noise_chunk_size=5,
             chunk_reward_mode='sum',
+            num_cameras=1,
+            # action_magnitude=1.0,
         )
     else:
         train_args_dict = dict(
