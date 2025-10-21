@@ -63,7 +63,14 @@ class DummyEnv(gym.ObservationWrapper):
 
     def __init__(self, variant):
         self.variant = variant
-        self.image_shape = (variant.resize_image, variant.resize_image, 3 * variant.num_cameras, 1)
+        num_cameras = getattr(
+            variant,
+            'num_cameras',
+            getattr(variant, 'train_kwargs', {}).get('num_cameras', 1),
+        )
+        # Ensure the attribute exists on the variant so downstream code can rely on it.
+        variant.num_cameras = num_cameras
+        self.image_shape = (variant.resize_image, variant.resize_image, 3 * num_cameras, 1)
         obs_dict = {}
         obs_dict['pixels'] = Box(low=0, high=255, shape=self.image_shape, dtype=np.uint8)
         if variant.add_states:

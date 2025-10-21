@@ -10,6 +10,7 @@ from flax.core import FrozenDict
 from flax.training import train_state
 
 from jaxrl2.agents.agent import Agent
+from jaxrl2.data.augmentations import batched_random_crop, color_transform
 from jaxrl2.networks.encoders.networks import Encoder
 from jaxrl2.networks.encoders.impala_encoder import ImpalaEncoder, SmallerImpalaEncoder
 from jaxrl2.networks.encoders.resnet_encoderv1 import ResNet18, ResNet34, ResNetSmall
@@ -155,9 +156,78 @@ def _make_encoder(encoder_type: str, encoder_norm: str, use_spatial_softmax: boo
     raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
+def _augment_pixels(
+    rng: PRNGKey,
+    pixels: jnp.ndarray,
+    random_crop: bool,
+    color_jitter: bool,
+    num_cameras: int,
+) -> Tuple[PRNGKey, jnp.ndarray]:
+    if random_crop and pixels.squeeze().ndim != 2:
+        rng, crop_key = jax.random.split(rng)
+        pixels = batched_random_crop(crop_key, pixels)
+
+    if color_jitter:
+        rng, color_key = jax.random.split(rng)
+        if num_cameras > 1:
+            for i in range(num_cameras):
+                color_key, cam_key = jax.random.split(color_key)
+                channel_slice = slice(i * 3, (i + 1) * 3)
+                camera_pixels = pixels[:, :, :, channel_slice]
+                jittered = color_transform(cam_key, camera_pixels.astype(jnp.float32) / 255.0)
+                jittered = (jittered * 255.0).astype(jnp.uint8)
+                pixels = pixels.at[:, :, :, channel_slice].set(jittered)
+        else:
+            jittered = color_transform(color_key, pixels.astype(jnp.float32) / 255.0)
+            pixels = (jittered * 255.0).astype(jnp.uint8)
+
+    return rng, pixels
+
+
+def _augment_batch(
+    rng: PRNGKey,
+    batch: FrozenDict,
+    random_crop: bool,
+    color_jitter: bool,
+    augment_next: bool,
+    num_cameras: int,
+) -> Tuple[PRNGKey, FrozenDict]:
+    rng, aug_pixels = _augment_pixels(
+        rng,
+        batch["observations"]["pixels"],
+        random_crop,
+        color_jitter,
+        num_cameras,
+    )
+    observations = batch["observations"].copy(add_or_replace={"pixels": aug_pixels})
+    batch = batch.copy(add_or_replace={"observations": observations})
+
+    if augment_next:
+        rng, aug_next_pixels = _augment_pixels(
+            rng,
+            batch["next_observations"]["pixels"],
+            random_crop,
+            color_jitter,
+            num_cameras,
+        )
+        next_observations = batch["next_observations"].copy(add_or_replace={"pixels": aug_next_pixels})
+        batch = batch.copy(add_or_replace={"next_observations": next_observations})
+
+    return rng, batch
+
+
 @functools.partial(
     jax.jit,
-    static_argnames=("discount", "tau", "distill_weight", "bc_weight"),
+    static_argnames=(
+        "discount",
+        "tau",
+        "distill_weight",
+        "bc_weight",
+        "random_crop",
+        "color_jitter",
+        "augment_next",
+        "num_cameras",
+    ),
 )
 def _update_jit(
     rng: PRNGKey,
@@ -170,6 +240,10 @@ def _update_jit(
     tau: float,
     distill_weight: float,
     bc_weight: float,
+    random_crop: bool,
+    color_jitter: bool,
+    augment_next: bool,
+    num_cameras: int,
 ) -> Tuple[
     PRNGKey,
     TrainState,
@@ -178,6 +252,7 @@ def _update_jit(
     Params,
     Dict[str, jnp.ndarray],
 ]:
+    rng, batch = _augment_batch(rng, batch, random_crop, color_jitter, augment_next, num_cameras)
     rng, critic_key, teacher_key, teacher_t_key, student_key = jax.random.split(rng, 5)
 
     actions = jnp.reshape(jnp.asarray(batch["actions"]), (batch["actions"].shape[0], -1))
@@ -290,6 +365,10 @@ class NoiseChunkFQLAgent(Agent):
         best_of_n: int = 0,
         use_best_of_n: bool = True,
         use_student_policy: bool = True,
+        num_cameras: int = 1,
+        random_crop: bool = False,
+        color_jitter: bool = False,
+        augment_next_observations: bool = False,
     ):
         self.discount = discount
         self.tau = tau
@@ -299,6 +378,10 @@ class NoiseChunkFQLAgent(Agent):
         self.use_best_of_n = use_best_of_n and best_of_n > 0
         self.use_student_policy = use_student_policy
         self.flow_num_integration_steps = flow_num_integration_steps
+        self.num_cameras = num_cameras
+        self.random_crop = random_crop
+        self.color_jitter = color_jitter
+        self.augment_next_observations = augment_next_observations
 
         observations = jax.tree_map(lambda x: jnp.asarray(x), observations)
         actions = jnp.asarray(actions)
@@ -404,9 +487,14 @@ class NoiseChunkFQLAgent(Agent):
             self._critic,
             self._target_critic_params,
             batch,
+            self.discount,
             self.tau,
             self.distill_weight,
             self.bc_weight,
+            self.random_crop,
+            self.color_jitter,
+            self.augment_next_observations,
+            self.num_cameras,
         )
         self.actor_teacher = new_teacher
         self.actor_student = new_student
