@@ -86,15 +86,35 @@ class ResNetEncoder(nn.Module):
     softmax_temperature: float = 1.0
 
     @nn.compact
-    def __call__(self, observations: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+    # def __call__(self, observations: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+    def __call__(
+        self,
+        observations: jnp.ndarray,
+        train: bool | None = None,
+        *,
+        training: bool | None = None,
+    ) -> jnp.ndarray:
+
+        if training is None:
+            training = True if train is None else train
+        elif train is not None and training != train:
+            raise ValueError("Conflicting 'train' and 'training' arguments.")
         
         x = observations.astype(jnp.float32) / 255.0
-        x = jnp.reshape(x, (*x.shape[:-2], -1))
+        # x = jnp.reshape(x, (*x.shape[:-2], -1))
+        if x.ndim == 5:
+            x = jnp.reshape(x, (*x.shape[:-2], -1))
+        elif x.ndim != 4:
+            raise ValueError(
+                "Expected observations with 4 or 5 dimensions (batch, height, width, channels[, extra]), "
+                f"got shape {x.shape}."
+            )
 
         conv = partial(self.conv, use_bias=False, dtype=self.dtype, kernel_init=kaiming_init())
         if self.norm == 'batch':
             norm = partial(nn.BatchNorm,
-                           use_running_average=not train,
+                        #    use_running_average=not train,
+                           use_running_average=not training,
                            momentum=0.9,
                            epsilon=1e-5,
                            dtype=self.dtype)
@@ -105,7 +125,8 @@ class ResNetEncoder(nn.Module):
                            dtype=self.dtype)
         elif self.norm == 'cross':
             norm = partial(CrossNorm,
-                           use_running_average=not train,
+                        #    use_running_average=not train,
+                           use_running_average=not training,
                            momentum=0.9,
                            epsilon=1e-5,
                            dtype=self.dtype)

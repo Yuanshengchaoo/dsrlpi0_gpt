@@ -290,7 +290,9 @@ class NoiseChunkFQLAgent(Agent):
         best_of_n: int = 0,
         use_best_of_n: bool = True,
         use_student_policy: bool = True,
-    ):
+        num_cameras: int = 1,
+    ):  
+        self.num_cameras = num_cameras
         self.discount = discount
         self.tau = tau
         self.distill_weight = distill_weight
@@ -404,6 +406,7 @@ class NoiseChunkFQLAgent(Agent):
             self._critic,
             self._target_critic_params,
             batch,
+            self.discount,
             self.tau,
             self.distill_weight,
             self.bc_weight,
